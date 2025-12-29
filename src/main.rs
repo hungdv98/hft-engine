@@ -1,113 +1,119 @@
-use hft_engine::core::{LatencyTracker, Price, Quantity, SpscQueue, pin_to_cpu, rdtsc};
+use hft_engine::core::{LatencyTracker, SpscQueue};
+use hft_engine::messages::{MarketEvent, RiskDecision, SignalEvent};
+use hft_engine::pipeline::{gateway, market_data, risk, strategy};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::Duration;
 
 fn main() {
-    println!("=== HFT Engine - Phase 1 Demo ===\n");
+    println!("=== HFT Engine - Phase 2 Demo ===\n");
+    println!("Starting 4-thread pipeline with lock-free SPSC queues...\n");
 
-    demo_fixed_point_types();
-    demo_spsc_queue();
-    demo_latency_tracking();
-    demo_cpu_pinning();
-}
+    let md_to_strategy = Arc::new(SpscQueue::<MarketEvent>::new(1024));
+    let strategy_to_risk = Arc::new(SpscQueue::<SignalEvent>::new(1024));
+    let risk_to_gateway = Arc::new(SpscQueue::<RiskDecision>::new(1024));
 
-fn demo_fixed_point_types() {
-    println!("--- Fixed-Point Types ---");
+    let shutdown = Arc::new(AtomicBool::new(false));
 
-    let price1 = Price::new(100, 2500);
-    let price2 = Price::new(50, 7500);
+    let md_tracker = Arc::new(LatencyTracker::new());
+    let strategy_tracker = Arc::new(LatencyTracker::new());
+    let risk_tracker = Arc::new(LatencyTracker::new());
+    let gateway_tracker = Arc::new(LatencyTracker::new());
 
-    println!("Price 1: {}", price1);
-    println!("Price 2: {}", price2);
-    println!("Sum: {}", price1 + price2);
-    println!("Difference: {}", price1 - price2);
+    let shutdown1 = shutdown.clone();
+    let shutdown2 = shutdown.clone();
+    let shutdown3 = shutdown.clone();
+    let shutdown4 = shutdown.clone();
 
-    let qty1 = Quantity::new(10, 5000);
-    let qty2 = Quantity::new(2, 0);
+    let md_queue = md_to_strategy.clone();
+    let strategy_in = md_to_strategy.clone();
+    let strategy_out = strategy_to_risk.clone();
+    let risk_in = strategy_to_risk.clone();
+    let risk_out = risk_to_gateway.clone();
+    let gateway_in = risk_to_gateway.clone();
 
-    println!("\nQuantity 1: {}", qty1);
-    println!("Quantity 2: {}", qty2);
-    println!("Sum: {}", qty1 + qty2);
-    println!("Product: {}", qty1 * qty2);
-    println!();
-}
+    let md_track = md_tracker.clone();
+    let strategy_track = strategy_tracker.clone();
+    let risk_track = risk_tracker.clone();
+    let gateway_track = gateway_tracker.clone();
 
-fn demo_spsc_queue() {
-    println!("--- SPSC Queue ---");
+    println!("Spawning threads on CPUs 0-3...\n");
 
-    let queue = Arc::new(SpscQueue::new(1024));
-    let queue_clone = queue.clone();
-
-    let messages = 100_000;
-
-    let producer = thread::spawn(move || {
-        for i in 0..messages {
-            while queue_clone.push(i).is_err() {
-                std::hint::spin_loop();
-            }
-        }
-        println!("Producer: sent {} messages", messages);
+    let md_thread = thread::spawn(move || {
+        market_data::run_market_data(
+            market_data::MarketDataConfig::default(),
+            md_queue,
+            shutdown1,
+            Some(md_track),
+        );
     });
 
-    let consumer = thread::spawn(move || {
-        let mut count = 0;
-        let mut sum = 0u64;
-
-        while count < messages {
-            if let Some(val) = queue.pop() {
-                sum += val;
-                count += 1;
-            } else {
-                std::hint::spin_loop();
-            }
-        }
-
-        println!("Consumer: received {} messages, sum = {}", count, sum);
+    let strategy_thread = thread::spawn(move || {
+        strategy::run_strategy(
+            strategy::StrategyConfig::default(),
+            strategy_in,
+            strategy_out,
+            shutdown2,
+            Some(strategy_track),
+        );
     });
 
-    producer.join().unwrap();
-    consumer.join().unwrap();
-    println!();
-}
+    let risk_thread = thread::spawn(move || {
+        risk::run_risk(
+            risk::RiskConfig::default(),
+            risk_in,
+            risk_out,
+            shutdown3,
+            Some(risk_track),
+        );
+    });
 
-fn demo_latency_tracking() {
-    println!("--- Latency Tracking ---");
+    let gateway_thread = thread::spawn(move || {
+        gateway::run_gateway(
+            gateway::GatewayConfig::default(),
+            gateway_in,
+            shutdown4,
+            Some(gateway_track),
+        );
+    });
 
-    let queue = SpscQueue::new(256);
-    let tracker = LatencyTracker::new();
+    println!("Pipeline running...\n");
+    thread::sleep(Duration::from_secs(5));
 
-    for i in 0..10_000 {
-        let start = rdtsc();
-        queue.push(i).unwrap();
-        let _ = queue.pop();
-        let end = rdtsc();
+    println!("\nSignaling shutdown...\n");
+    shutdown.store(true, Ordering::Relaxed);
 
-        tracker.record(end - start);
+    md_thread.join().unwrap();
+    strategy_thread.join().unwrap();
+    risk_thread.join().unwrap();
+    gateway_thread.join().unwrap();
+
+    println!("\n=== Latency Statistics ===\n");
+
+    let md_stats = md_tracker.stats().to_nanos(3.0);
+    println!("Market Data:  {}", md_stats);
+
+    let strategy_stats = strategy_tracker.stats().to_nanos(3.0);
+    println!("Strategy:     {}", strategy_stats);
+
+    let risk_stats = risk_tracker.stats().to_nanos(3.0);
+    println!("Risk:         {}", risk_stats);
+
+    let gateway_stats = gateway_tracker.stats().to_nanos(3.0);
+    println!("Gateway:      {}", gateway_stats);
+
+    let total_avg_ns =
+        md_stats.avg_ns + strategy_stats.avg_ns + risk_stats.avg_ns + gateway_stats.avg_ns;
+
+    println!("\nEnd-to-End:   {} ns average", total_avg_ns);
+    println!("Target:       < 1000 ns (1 µs)");
+
+    if total_avg_ns < 1000 {
+        println!("Target achieved!");
+    } else {
+        println!("Above target");
     }
 
-    let stats = tracker.stats();
-    println!("SPSC Queue Latency (10000 iterations):");
-    println!("  Count: {}", stats.count);
-    println!("  Min:   {} cycles", stats.min);
-    println!("  Avg:   {} cycles", stats.avg);
-    println!("  Max:   {} cycles", stats.max);
-
-    let stats_ns = stats.to_nanos(3.0);
-    println!("\nConverted to nanoseconds:");
-    println!("  {}", stats_ns);
-    println!();
-}
-
-fn demo_cpu_pinning() {
-    println!("--- CPU Affinity ---");
-
-    let num_cpus = hft_engine::core::thread::num_cpus();
-    println!("Available CPUs: {}", num_cpus);
-
-    match pin_to_cpu(0) {
-        Ok(_) => println!("Successfully pinned main thread to CPU 0"),
-        Err(e) => println!("CPU pinning failed (may be unsupported): {}", e),
-    }
-
-    println!("\n=== Phase 1 Demo Complete ===");
+    println!("\n=== Phase 2 Demo Complete ===");
 }

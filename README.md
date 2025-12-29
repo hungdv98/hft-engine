@@ -117,45 +117,6 @@ MarketData → SPSC → Strategy → SPSC → Risk → SPSC → Gateway
 RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
 
-### Run
-
-```bash
-taskset -c 0-3 ./target/release/hft-engine
-```
-
----
-
-## Benchmarks
-
-### SPSC Ring Buffer
-
-```
-Throughput: ~100M ops/sec
-Latency:    ~8–15 ns/op
-```
-
-### Market Replay
-
-```
-5M msgs/sec sustained
-Deterministic playback
-```
-
----
-
-## Profiling & Analysis
-
-Supported tools:
-
-* `perf`
-* `flamegraph`
-* hardware counters
-* cache-miss analysis
-
-```bash
-perf record -g ./hft-engine
-```
-
 ---
 
 ## Risk Controls
